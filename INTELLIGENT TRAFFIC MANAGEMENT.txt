@@ -1,0 +1,238 @@
+import time
+import cv2
+import numpy as np
+from gpiozero import TrafficLights, LED
+import RPi.GPIO as GPIO
+from scipy.fftpack import fft
+import pyaudio
+
+class Webster_method:
+    def __init__(self):
+        self.cycle_length = 30  # Initial cycle length
+
+    def calculate_signal_durations(self, traffic_density):
+        # Implement Webster's method to calculate green_duration and red_duration
+        # based on the given traffic_density
+        cycle_length_adjusted = self.cycle_length + (10 * (traffic_density - 50) / 100)  # Adjust cycle length based on traffic density
+
+        green_duration = cycle_length_adjusted * (1 - (traffic_density / 100))  # Calculate green duration
+        red_duration = cycle_length_adjusted - green_duration  # Calculate red duration
+
+        return int(green_duration), int(red_duration)
+
+class TrafficSignalControl:
+    def __init__(self, yolo_model_path, yolo_config_path):
+        self.north_lights = TrafficLights(5, 6, 13)
+        self.south_lights = TrafficLights(19, 26, 21)
+        self.east_lights = TrafficLights(23, 24, 25)
+        self.west_lights = TrafficLights(12, 16, 20)
+
+        # Load YOLO model
+        self.net = cv2.dnn.readNet(yolo_model_path, yolo_config_path)
+        self.layer_names = self.net.getUnconnectedOutLayersNames()
+
+        # Additional initialization
+        self.green_duration = 10
+        self.red_duration = 5
+        self.webster_method = Webster_method()
+
+    def measure_traffic_density(self, frame):
+        height, width = frame.shape[:2]
+
+        blob = cv2.dnn.blobFromImage(frame, 0.00392, (416, 416), (0, 0, 0), True, crop=False)
+        self.net.setInput(blob)
+        outs = self.net.forward(self.layer_names)
+
+        # Process YOLO outputs and count detected vehicles
+        vehicle_count = 0
+        for out in outs:
+            for detection in out:
+                scores = detection[5:]
+                class_id = np.argmax(scores)
+                confidence = scores[class_id]
+                if confidence > 0.5 and class_id == 2:  # Assuming class_id 2 corresponds to vehicles
+                    vehicle_count += 1
+
+        traffic_density = (vehicle_count / (width * height)) * 100
+        return traffic_density
+
+    def update_traffic_signal(self, traffic_density):
+        # Update traffic signal duration based on traffic density using the Webster_method
+        self.green_duration, self.red_duration = self.webster_method.calculate_signal_durations(traffic_density)
+
+        # Control traffic lights
+        self.north_lights.turn_green()
+        self.south_lights.turn_green()
+        self.east_lights.turn_green()
+        self.west_lights.turn_green()
+
+        time.sleep(self.green_duration)
+
+        # Turn off all lights after green duration
+        self.north_lights.turn_red()
+        self.south_lights.turn_red()
+        self.east_lights.turn_red()
+        self.west_lights.turn_red()
+
+        time.sleep(self.red_duration)
+
+class TrafficSignalAndBarrierSystem:
+    def __init__(self, camera_resolution=(640, 480), video_source=0, speed_threshold=30, speed_limit=60):
+        GPIO.setmode(GPIO.BCM)
+
+        # Traffic signal initialization
+        self.green_duration = 10
+        self.red_duration = 5
+        self.traffic_lights = TrafficLights(17, 27, 22)  # GPIO pins for traffic lights
+
+        # Barrier initialization
+        self.barrier_pins = [18, 23, 24, 25]  # GPIO pins for the 4 barriers
+        self.barriers = [Barrier(pin) for pin in self.barrier_pins]
+
+        # Overspeed detection initialization
+        self.camera_resolution = camera_resolution
+        self.camera = cv2.VideoCapture(video_source)
+        self.previous_frame = None
+        self.speed_threshold = speed_threshold
+        self.speed_limit = speed_limit
+        self.ticket_led = LED(23)  # GPIO pin for the ticket LED
+
+        # Ambulance detection initialization
+        self.sound_pin = 14  # GPIO pin for the sound sensor
+        GPIO.setup(self.sound_pin, GPIO.IN)
+        self.LED_PIN = 24  # GPIO pin for the emergency LED
+
+        # Traffic Signal Control initialization
+        self.traffic_signal_control = TrafficSignalControl('path/to/yolov3.weights', 'path/to/yolov3.cfg')
+        self.webster_method = Webster_method()
+
+    def control_barrier(self, barrier_index, is_open):
+        if is_open:
+            self.barriers[barrier_index].lift()
+        else:
+            self.barriers[barrier_index].lower()
+
+    def calculate_green_duration(self, traffic_density):
+        if traffic_density == 0:
+            return 10  # Default green duration when no traffic is detected
+
+        cycle_time = traffic_density * (1 + 0.5)  # Assuming LOSS_FACTOR is 0.5
+        green_time = 1.0 * traffic_density * (cycle_time / traffic_density) ** 2 / (2 * (1 + 0.5))  # Assuming WEIGHTING_FACTOR is 1.0
+        return int(green_time)
+
+    def update_traffic_signal(self, traffic_density, barrier_indices):
+        self.green_duration, self.red_duration = self.webster_method.calculate_signal_durations(traffic_density)
+
+        # Control traffic lights and barriers
+        self.traffic_lights.green.on()
+        for barrier_index in barrier_indices:
+            self.control_barrier(barrier_index, is_open=True)  # Lift the barriers
+        time.sleep(self.green_duration)
+        self.traffic_lights.green.off()
+        for barrier_index in barrier_indices:
+            self.control_barrier(barrier_index, is_open=False)  # Lower the barriers
+        self.traffic_lights.red.on()
+        time.sleep(self.red_duration)
+        self.traffic_lights.red.off()
+
+    def measure_traffic_density(self, frame):
+        return self.traffic_signal_control.measure_traffic_density(frame)
+
+    def calculate_speed(self, frame):
+        if self.previous_frame is None:
+            self.previous_frame = frame
+            return 0
+
+        # Convert frames to grayscale
+        gray_prev = cv2.cvtColor(self.previous_frame, cv2.COLOR_BGR2GRAY)
+        gray_curr = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # Compute the absolute difference between frames
+        frame_diff = cv2.absdiff(gray_curr, gray_prev)
+
+        # Use image processing techniques to detect and track moving objects
+        _, threshold_diff = cv2.threshold(frame_diff, 30, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(threshold_diff, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        speeds = []
+
+        for contour in contours:
+            if cv2.contourArea(contour) > 100:
+                x, y, w, h = cv2.boundingRect(contour)
+                speed = w  # Simplified speed calculation (replace with a more accurate method)
+                speeds.append(speed)
+
+        # Update the previous frame
+        self.previous_frame = frame
+
+        return speeds
+
+    def check_speeding(self, speeds):
+        for speed in speeds:
+            if speed > self.speed_threshold:
+                return True
+        return False
+
+    def issue_ticket(self):
+        print("Overspeed detected! Issuing a ticket.")
+        self.ticket_led.on()
+        time.sleep(5)  # Assume the ticket LED stays on for 5 seconds
+        self.ticket_led.off()
+
+    def ambulance_detection(self):
+        # Checking for ambulance sound
+        for i in range(1, 31):
+            state = GPIO.input(self.sound_pin)
+            if state == GPIO.LOW:
+                print(i, end=", ")
+                time.sleep(1)
+            elif state == GPIO.HIGH:
+                print("AMBULANCE CROSSING")
+                self.turn_all_green_for_ambulance()
+                time.sleep(5)
+                # Turn off all traffic lights after 5 seconds
+                self.traffic_lights.green.off()
+                self.traffic_lights.red.off()
+                return
+
+    def sound_sensor_processing(self):
+        vReal, _ = self.collect_audio_samples()
+
+        windowed_data = vReal * np.hamming(len(vReal))
+        magnitude = np.abs(fft(windowed_data))
+
+        peak_frequency = np.argmax(magnitude) * (10000 / len(vReal))
+
+        if self.traffic_signal_control.is_emergency_sound(peak_frequency):
+            # Emergency sound detected
+            GPIO.output(self.LED_PIN, GPIO.HIGH)
+            print("Emergency sound detected! Traffic light turned to green.")
+            # Add additional actions here (e.g., triggering an alarm, sending a signal to other devices)
+        else:
+            GPIO.output(self.LED_PIN, GPIO.LOW)
+
+    def is_emergency_sound(self, peak_frequency):
+        return self.traffic_signal_control.is_emergency_sound(peak_frequency)
+
+    def collect_audio_samples(self):
+        p = pyaudio.PyAudio()
+        stream = p.open(format=pyaudio.paInt16, channels=1, rate=10000, input=True, frames_per_buffer=1024)
+        data = stream.read(1024)
+        stream.close()
+        p.terminate()
+
+        vReal = np.frombuffer(data, dtype=np.int16)
+        return vReal, 10000
+
+    def turn_all_green_for_ambulance(self):
+        if self.traffic_lights.green.is_active == False:
+            self.traffic_lights.green.on()
+        if self.traffic_lights.red.is_active == True:
+            self.traffic_lights.red.off()
+        time.sleep(2)  # Assume the green light stays on for 2 seconds
+        self.traffic_lights.green.off()
+
+if __name__ == "__main__":
+    # Initialize and run the traffic signal and barrier system
+    traffic_system = TrafficSignalAndBarrierSystem()
+    traffic_system.run_system(system_duration=600)
